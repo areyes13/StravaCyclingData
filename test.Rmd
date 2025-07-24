@@ -1,0 +1,674 @@
+---
+title: "Strava Test"
+output: html_document
+date: "2025-06-25"
+---
+## R Packages & Settings
+([Reference](https://forum.posit.co/t/strava-data-r-views-submission/115858/))
+```{r libs, message=F, warning=F}
+library(conflicted)
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(httr)
+library(rStrava)
+library(googleway)
+library(plotly)
+library(showtext)
+library(knitr)
+
+```
+
+```{r project settings, echo = F, warning=F}
+setwd("D:/Alejandro/Documents/R Projects/Strava")
+
+knitr::opts_chunk$set(echo = TRUE)
+
+options(java.parameters = "-Xmx8000m")
+options(scipen=999)
+
+# UPDATE TO YOUR WORKING DIRECTORY
+setwd("D:/Alejandro/Documents/R Projects/Strava")
+
+# IBM PLEX SANS
+font_add(family = "IBM Plex Sans", # Name you want to use 
+         regular = "IBMPlexSans-Regular.ttf",
+         bold = "IBMPlexSans-Bold.ttf")
+
+# IBM PLEX SANS LIGHT (FOR PLOT TEXT)
+font_add(family = "IBM Plex Sans Light", # Name you want to use 
+         regular = "IBMPlexSans-Light.ttf")
+
+showtext_auto()
+
+conflicts_prefer(
+  dplyr::filter(),
+  dplyr::lag(),
+)
+```
+
+## Strava API Setup
+([Reference](https://github.com/fawda123/rStrava))
+```{r Strava API Setup, eval = F}
+# load credentials from .env file in repository
+readRenviron(".env")
+
+# Create authentication token for API
+stoken <- httr::config(token = strava_oauth(app_name = Sys.getenv("APP_NAME"), 
+                                            app_client_id = Sys.getenv("APP_CLIENT_ID"),
+                                            app_secret = Sys.getenv("STRAVA_SECRET"), 
+                                            app_scope="activity:read_all",
+                                            cache = T))
+
+
+```
+
+```{r Authorization, echo=F}
+# load pre-existing token
+stoken <- httr::config(token = readRDS('.httr-oauth')[[1]])
+```
+
+## API Data Pulls
+```{r Data Pulls}
+act_raw <- get_activity_list(stoken, 
+                             after = as.Date('2019-08-01'),
+                             before = as.Date('2025-06-01')) 
+
+act_df <- act_raw %>%
+  compile_activities() %>%
+  filter(sport_type %in% c('GravelRide', 'Ride'),
+         distance >= 15 | total_elevation_gain >= 75) %>%
+  # remove rows without polylines
+  chk_nopolyline()
+
+# total elevation gain needs to be numeric for unit conversion
+act_df$total_elevation_gain <- round(as.numeric(as.character(act_df$total_elevation_gain)), 1)
+act_df$activity <- as.numeric(as.character(act_df$upload_id))
+```
+
+
+
+
+
+## Power data?
+```{r Power Data setup}
+# function to read stream data from Strava (from url above)
+read_activity_stream <- function(id, sig) {
+  act_url <- parse_url(stringr::str_glue(
+    "https://www.strava.com/api/v3/activities/{id}/streams"))
+  access_token <- sig$credentials$access_token[[1]]
+
+  r <- modify_url(
+    act_url,
+    query = list(
+      access_token = access_token,
+      keys = str_glue(
+        "distance,time,latlng,altitude,velocity_smooth,heartrate,cadence,watts,
+        temp,moving,grade_smooth"))) %>%
+    GET()
+
+  stop_for_status(r)
+
+  fromJSON(content(r, as = "text"), flatten = TRUE) %>%
+    as_tibble() %>%
+    mutate(id = id)
+}
+
+# wide format
+meas_wide <- function(df_meas) {
+  pivot_wider(df_meas, names_from = type, values_from = data)
+}
+
+# unnest data
+meas_pro <- function(df_meas_wide) {
+  df_meas_wide %>%
+    mutate(
+      lat = map_if(
+        .x = latlng, .p = ~ !is.null(.x), .f = ~ .x[, 1]),
+      lng = map_if(
+        .x = latlng, .p = ~ !is.null(.x), .f = ~ .x[, 2])) %>%
+    select(-c(latlng, original_size, resolution)) %>%
+    unnest(where(is_list))
+}
+```
+
+# query for a big ride 14361066739
+```{r ASUPITE LINE}
+iwate_act <- get_activity_list(stoken, id = '14361066739')
+iwate_stream <- get_activity_streams(iwate_act, stoken)
+
+iwate_stream %>%
+  as_tibble()
+```
+
+# slope x watts?
+```{r slope x watts}
+# create color scale for FTP zones
+FTP <- 165
+zone_cut <- c(0, 0.55, 0.75, 0.90, 1.05, 1.20, 1.50, Inf)
+zone_names <- c('Active Recovery', 'Endurance', 'Tempo', 'Threshold', 'VO2Max', 'Anaerobic', 'Neuromuscular', NA)
+ftp_color <- c('grey80', '#408DFF', '#61BC5A', '#FACB3D', '#F76939', '#F73C09', 'black')
+
+# create breaks for route gradient
+terrain_breaks <- c(-Inf, -10, -6, -2, 2, 6, 10, Inf)
+
+# make a reference table we can use to map features
+zone_ref <- tibble(
+  zone = zone_names,
+  zone_cut = zone_cut * FTP,
+  dummy = 1:length(zone_cut)) %>%
+  select(-zone_cut)
+
+```
+
+
+# all streams?
+```{r ASUPITE LINE}
+# get list of all IDs
+activity_ids <- act_df %>% 
+  distinct(id) %>%
+  pull(id)
+
+# too many ids to query in one go, make nested list of ids (x100 per chunk)
+n <- 50
+chunker <- split(activity_ids, ceiling(seq_along(activity_ids)/n))
+
+# empty tibble to stack with chunks
+stream_vars <- c('altitude', 'cadence', 'distance', 'grade_smooth', 'lat', 'lng', 'moving', 'temp', 'time', 'velocity_smooth', 'id')
+stream_empty <- stream_vars %>% purrr::map_dfc(setNames, object = list(logical()))
+
+# set up empty list to store the chunks
+# The default overall rate limit allows 200 requests every 15 minutes, with up to 2,000 requests per day.
+out <- vector("list", length = length(chunker))
+for (i in i:length(chunker)) {
+  print(paste0("Querying Stream from Chunk ", i,"..."))
+  
+  pull <- get_activity_streams(act_raw,
+                              id = chunker[[i]], 
+                              stoken) %>%
+    as_tibble()
+  
+  # keep track of chunk
+  pull$chunk_id <- i
+  out[[i]] <- pull
+  
+  # put a sleep timer of 15 min every 100 queries to not get rate limited by Strava API
+  if((n * i) %in% seq(0, 1E5, by = 100)) {
+    paste0('Sleeping for 15 min:      ', Sys.time())
+    Sys.sleep(15 * 60) 
+  }
+}
+
+# combine into single df
+stream_df <- bind_rows(out)
+
+
+# set up bins
+# map in some fields from act_df
+stream_plotter <- stream_df %>%
+  left_join(act_df %>% distinct(id, name, start_date), 
+            by = 'id') %>%
+  arrange(start_date) %>%
+  mutate(zone_cut = cut(watts, breaks = zone_cut * FTP, include.lowest = T),
+         terrain_type = cut(grade_smooth, breaks = terrain_breaks),
+         dummy = as.numeric(as.factor(zone_cut))) %>%
+  left_join(zone_ref, by ='dummy')
+
+
+stream_plotter %>%
+  filter(watts>0) %>%
+  ggplot(aes(x = grade_smooth, y = watts/54))+
+  geom_point(aes(fill = zone_cut, color = zone_cut), 
+             alpha = 1/2, shape = 21, stroke = 1)+
+  geom_smooth(color = 'grey50', se = F, linetype = 'dashed')+
+  scale_color_manual(values = ftp_color, labels = zone_names, name = 'FTP Zone')+
+  scale_fill_manual(values = ftp_color, labels = zone_names, name = 'FTP Zone')+
+  scale_x_continuous(name = '\nGradient (%)', 
+                     label=comma,
+                     expand = c(0,0),
+                     breaks = seq(-30,30, by = 5))+
+  scale_y_continuous(name = 'Watts / kg\n',
+                     label=comma,
+                     expand = c(0,0),
+                     breaks = seq(0, 20, by = 2)) +
+  theme_classic()+
+  theme(text = element_text(family="IBM Plex Sans"),
+        legend.position = "right",
+        legend.text = element_text(size = 16, family = 'IBM Plex Sans Light'),
+        legend.title = element_text(size = 20),
+        plot.title = element_text(face = 'bold', color = 'grey20', size = 30),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.text.x = element_text(size = 20),
+        axis.text.y = element_text(size = 24),
+        panel.border = element_blank(),
+        plot.background = element_blank())
+```
+
+```{r total work by zone}
+zone_plotter <- stream_plotter %>%
+  group_by(id) %>%
+  mutate(dist_diff = distance - lag(distance, default = 0),
+         climb_diff = ifelse(altitude - lag(altitude, default = 0) >= 0, altitude - lag(altitude, default = 0), 0), # only include elev gains
+         time_diff = coalesce(time - lag(time, default = 0), 0), # seconds
+         work = coalesce((time_diff * watts)/1000, 0)) %>%
+  filter(watts > 0) %>%
+  group_by(zone) %>%
+  summarise(dist_diff = sum(dist_diff),
+            climb_diff = sum(climb_diff),
+            time_diff = sum(time_diff)/3660,
+            work = sum(work)) %>%
+  ungroup %>%
+  mutate(zone = factor(zone, levels = zone_names)) %>%
+  filter(!is.na(zone)) 
+  
+
+
+ftp_total_plot <- zone_plotter %>%
+  pivot_longer(!zone, names_to = 'var') %>%
+  group_by(var) %>%
+  mutate(prct = value / sum(value)) %>%
+  ungroup() %>%
+  filter(var == 'time_diff') %>%
+  ggplot(aes(zone, 
+             prct, 
+             fill = zone))+
+  geom_col(color = 'grey20')+
+  scale_y_continuous(expand = c(0,0), labels = scales::percent, 
+                     limits = c(0,.33), breaks = seq(0,.5, by = 0.05),
+                     name = 'Total Moving Time (%)\n')+
+  scale_x_discrete(name='')+
+  scale_fill_manual(values = ftp_color, labels = zone_names, name = 'FTP Zone', guide = 'none')+
+  theme_classic()+
+  theme(text = element_text(family="IBM Plex Sans"),
+        legend.position = "right",
+        legend.text = element_text(size = 16, family = 'IBM Plex Sans Light'),
+        legend.title = element_text(size = 20),
+        plot.title = element_text(face = 'bold', color = 'grey20', size = 30),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.text.x = element_text(size = 18, angle = 37, hjust = 1),
+        axis.text.y = element_text(size = 24),
+        panel.border = element_blank(),
+        plot.background = element_blank())
+
+ggsave(plot = ftp_total_plot,
+       filename = "Total FTP distribution.png", 
+       width = 4.5, height = 3, units = "in",
+       dpi = 300, type = "cairo")
+
+
+
+
+# Total Distance
+D <- act_df %>%
+  filter(start_date >= '2024-01-01') %>%
+  pull(distance) %>%
+  sum()
+
+# number of chunks
+n <- 20
+
+
+# split up activities into n chunks by start date
+# then map into stream data to track changes over time
+time_chunks <- act_df %>%
+  filter(start_date >= '2024-01-01') %>%
+  arrange(start_date) %>%
+  ungroup() %>%
+  mutate(tot_distance = cumsum(distance),
+         chunk = as.numeric(cut_interval(tot_distance, length = D/n))) %>%
+  select(id, chunk)
+
+# remove records without power data
+delta_df <- stream_plotter %>%
+  left_join(time_chunks) %>%
+  filter(!is.na(chunk)) %>%
+  arrange(start_date) %>%
+  group_by(id) %>%
+  mutate(dist_diff = distance - lag(distance, default = 0),
+         climb_diff = ifelse(altitude - lag(altitude, default = 0) >= 0, altitude - lag(altitude, default = 0), 0), # only include elev gains
+         time_diff = coalesce(time - lag(time, default = 0), 0), # seconds
+         work = coalesce((time_diff * watts)/1000, 0)) %>%
+  group_by(chunk, zone) %>%
+  summarise(dist_diff = sum(dist_diff),
+            climb_diff = sum(climb_diff),
+            time_diff = sum(time_diff)/3660,
+            work = sum(work)) %>%
+  ungroup %>%
+  mutate(zone = factor(zone, levels = zone_names)) %>%
+  filter(!is.na(zone)) %>%
+  pivot_longer(!c(zone, chunk), names_to = 'var') %>%
+  group_by(var, chunk) %>%
+  mutate(prct = value / sum(value)) %>%
+  ungroup()
+
+
+delta_df %>%
+  filter(var == 'time_diff') %>%
+  ggplot(aes(chunk, prct, fill = zone))+
+  geom_line()+
+  geom_point(shape = 21, size = 3)+
+  scale_fill_manual(values = ftp_color, labels = zone_names, name = 'FTP Zone', guide = 'none')+
+  theme_classic()
+
+```
+
+```{r binned avg pw trend}
+
+# make a dataframe where we keep track of the total distance of the PREVIOUS ride so we can plot smoothly
+distance_cum_ref <- stream_plotter %>%
+  left_join(time_chunks) %>%
+  filter(!is.na(chunk), !is.na(watts)) %>%
+  arrange(start_date) %>%
+  group_by(id) %>%
+  mutate(dist_total = last(distance)) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  mutate(dist_cum = cumsum(dist_total) %>% lag(n = 1, default = 0)) %>%
+  select(id, dist_cum)
+
+slice <- .25
+delta_df <- stream_plotter %>%
+  left_join(time_chunks) %>%
+  filter(!is.na(chunk)) %>%
+  arrange(start_date) %>%
+  group_by(id, chunk) %>%
+  mutate(time_diff = coalesce(time - lag(time, default = 0), 0), # seconds
+         dist_diff = distance - lag(distance, default = 0),
+         work = coalesce((time_diff * watts)/1000, 0),
+         dist_cut = as.numeric(cut_interval(distance, length = slice))) %>%
+  group_by(id, dist_cut, chunk) %>%
+  summarise(watts = sum(coalesce(watts, 0) * dist_diff)/slice) %>%
+  left_join(distance_cum_ref, by = 'id') %>%
+  mutate(dist_total = dist_cum + dist_cut * slice,
+         zone_cut = cut(watts, breaks = zone_cut * FTP, include.lowest = T),
+         dummy = as.numeric(as.factor(zone_cut))) %>%
+  left_join(zone_ref, by ='dummy')
+
+
+
+delta_df %>%
+  ggplot(aes(dist_total, watts/52))+
+  geom_point(aes(color = zone_cut))+
+  geom_smooth()+
+  scale_color_manual(values = ftp_color, labels = zone_names, name = 'FTP Zone')+
+  theme_classic()
+
+
+
+
+
+
+```
+
+
+
+```{r stream eda}
+
+
+# what % of time by terrain type
+terrain_plotter <- stream_plotter %>%
+  group_by(id) %>%
+  mutate(dist_diff = distance - lag(distance, default = 0),
+         climb_diff = ifelse(altitude - lag(altitude, default = 0) >= 0, altitude - lag(altitude, default = 0), 0), # only include elev gains
+         time_diff = coalesce(time - lag(time, default = 0), 0), # seconds
+         work = coalesce((time_diff * watts)/1000, 0)) %>%
+  filter(watts > 0) %>%
+  group_by(terrain_type) %>%
+  summarise(dist_diff = sum(dist_diff),
+            climb_diff = sum(climb_diff),
+            time_diff = sum(time_diff)/3660,
+            work = sum(work)) 
+
+# facet grid by terrain type
+terrain_plotter %>%
+  pivot_longer(!terrain_type, names_to = 'var') %>%
+  group_by(var) %>%
+  mutate(prct = value/sum(value)) %>%
+  ggplot(aes(terrain_type, prct, fill = terrain_type))+
+  geom_col(color = 'grey20')+
+  scale_fill_brewer(palette = 'RdBu', direction = -1, name = 'Terrain Gradient (%)')+
+  theme_classic()+
+  facet_wrap(~var)
+
+# points?
+terrain_plotter %>%
+  mutate(across(is.numeric, ~ ./sum(.))) %>%
+  ggplot(aes(dist_diff, work, fill = terrain_type))+
+  geom_point(shape = 21, size = 4)+
+  geom_abline(slope = 1, intercept = 0, linetype = 'dashed')+
+  scale_fill_brewer(palette = 'RdBu', direction = -1, name = 'Terrain Gradient (%)')+
+  scale_x_continuous(breaks = seq(0, 1, by = 0.05), limits = c(0,.25))+
+  scale_y_continuous(breaks = seq(0, 1, by = 0.05), limits = c(0,.25))+
+  theme_bw()
+```
+
+
+```{r basic eda}
+act_df %>%
+  summarise(distance = sum(distance),
+            climb = sum(total_elevation_gain),
+            speed = mean(average_speed),
+            max_speed = max(max_speed),
+            moving_time = sum(moving_time)/(60^2))
+
+
+stream_df %>%
+  group_by(id) %>%
+  mutate(time_diff = coalesce(time - lag(time, default = 0), 0), # seconds,
+         work = coalesce((time_diff * watts)/1000, 0)) %>% #kJ
+  filter(!is.na(watts)) %>%
+  ungroup() %>%
+  summarise(time_diff = sum(time_diff)/(60^2),
+            work = sum(work))
+
+
+# find steepest 500m section?
+dist_slice <- .5
+stream_df %>% 
+  group_by(id) %>%
+  mutate(dist_diff = distance - lag(distance, default = 0),
+         climb_diff = ifelse(altitude - lag(altitude, default = 0) >= 0, altitude - lag(altitude, default = 0), 0), # only include elev gains
+         time_diff = coalesce(time - lag(time, default = 0), 0), # seconds
+         work = coalesce((time_diff * watts)/1000, 0)) %>%
+  mutate(dist_cut = cut_interval(distance, length = dist_slice)) %>%
+  group_by(id, dist_cut) %>%
+  summarise(grade = sum(grade_smooth * dist_diff)/dist_slice) %>%
+  ungroup() %>%
+  mutate(distance = as.numeric(dist_cut)*dist_slice) %>%
+  left_join(act_df %>% distinct(id, name, start_date), 
+            by = 'id') %>%
+  group_by(id) %>%
+  filter(grade == max(grade)) %>%
+  arrange(-grade)
+```
+
+
+
+# latitude and longitude
+```{r elevation & gps coordinates}
+
+
+# Create df of latitude and longitudes
+lat_lon <- act_df %>% 
+  group_by(upload_id) %>%
+  nest() %>% 
+  # from Google elevation API
+  mutate(locs = purrr::map(data, function(x) get_latlon(x$map.summary_polyline, key = Sys.getenv('GOOGLE_KEY')))) %>% 
+  select(-data) %>%
+  ungroup() %>% 
+  unnest(locs) %>%
+  full_join(., act_df, by = 'upload_id') %>%
+  select(., upload_id, type, start_date, lat, lon, ele, total_elevation_gain)
+
+# total elevation gain needs to be numeric for unit conversion
+lat_lon$total_elevation_gain <- round(as.numeric(as.character(lat_lon$total_elevation_gain)), 1)
+lat_lon$activity <- as.numeric(as.character(lat_lon$upload_id))
+lat_lon$upload_id <- NULL
+
+# get distances by activity
+distances <- group_by(lat_lon, activity) %>%
+  mutate(., distance = get_dists(lon, lat))
+lat_lon$distance <- distances$distance
+
+
+# format date, total_elevation_gain, create facet labels
+lat_lon <- mutate(lat_lon,
+                         start_date = gsub('T.*$', '', start_date),  
+                         start_date = as.Date(start_date, format = '%Y-%m-%d'),
+                         total_elevation_gain = paste('Elev. gain', total_elevation_gain)) %>% 
+  unite('facets', activity, start_date, total_elevation_gain, sep = ', ')
+
+
+
+# set up a dummy id to group rides starting in similar area
+id_ref <- act_df %>%
+  as_tibble() %>%
+  arrange(-round(end_latlng1, 0), start_date) %>%
+  mutate(dummy_id = row_number()) %>%
+  # select(upload_id, dummy_id) %>%
+  mutate(start_date = gsub('T.*$', '', start_date),  
+         start_date = as.Date(start_date, format = '%Y-%m-%d'),
+         total_elevation_gain = paste('Elev. gain', total_elevation_gain)) %>% 
+  unite('facets', activity, start_date, total_elevation_gain, sep = ', ') %>%
+  distinct(facets, dummy_id)
+
+
+# merge dummy id
+lat_lon <- lat_lon %>%
+  left_join(id_ref, by = 'facets')
+
+
+# make a dataframe where we keep track of the total distance of the PREVIOUS ride so we can plot smoothly
+distance_cum_ref <- lat_lon %>% 
+  arrange(dummy_id) %>%
+  group_by(dummy_id) %>%
+  mutate(dist_total = last(distance)) %>%
+  ungroup() %>%
+  distinct(dummy_id, .keep_all = T) %>%
+  mutate(dist_cum = cumsum(dist_total) %>% lag(n = 1, default = 0)) %>%
+  select(dummy_id, dist_cum)
+
+# merge into lat_lon act_df
+lat_lon <- lat_lon %>%
+  left_join(distance_cum_ref, by = 'dummy_id') %>%
+  mutate(dist_total = dist_cum + distance,
+         ele = ifelse(distance == 0, lag(ele, 1, default = 0), ele))
+```
+
+# single 3d elevation
+```{r 3d}
+
+dist_slice <- 0.2
+# reference table for single activity's gradient profile that we can map to latitude and longitude data
+grade_ref <- stream_plotter %>%
+  filter(id == 2867971393) %>%
+  mutate(dist_cut = cut_interval(distance, length = dist_slice),
+         dist_diff = distance - lag(distance, default = 0),
+         climb_diff = ifelse(altitude - lag(altitude, default = 0) >= 0, altitude - lag(altitude, default = 0), 0), # only include elev gains
+         time_diff = coalesce(time - lag(time, default = 0), 0), # seconds
+         work = coalesce((time_diff * watts)/1000, 0)) %>%
+  group_by(dist_cut) %>%
+  summarise(grade = sum(grade_smooth * dist_diff)/dist_slice) %>%
+  ungroup() %>%
+  mutate(distance = as.numeric(dist_cut)*dist_slice,
+         terrain_type = cut(grade, breaks = terrain_breaks)) %>%
+  select(dist_cut, terrain_type, grade)
+
+
+
+# Radius of Earth (for converting to cartesian plane)
+R <- 6371 #km
+three_df <- lat_lon %>%
+  filter(grepl("3043152805", facets)) %>%
+  # need to convert from latitude and longitude to Cartesian coordinate system
+  mutate(x = R * cos(lat) * cos(lon),
+         y = R * cos(lat) * sin(lon),
+         dist_cut = cut_interval(distance, length = dist_slice)) %>%
+  # bring in gradient data from stream queries
+  left_join(grade_ref, by = 'dist_cut') %>%
+  mutate(terrain_type = as.numeric(terrain_type)-4) %>%
+  mutate(grade = ifelse(distance > 29.5 & distance <= 30.2, NA, grade)) %>%
+  filter(distance <=29.5)
+
+p = plot_ly(data = three_df, x = ~x, y = ~y, z = ~ele,
+        type = 'scatter3d', mode = 'lines',
+        line = list(width = 10,
+                    color = ~terrain_type,
+                      colorscale = list(c(-25, rgb(202,0,32, maxColorValue = 255)),
+                                        c(20, rgb(5,113,176, maxColorValue = 255))),
+                      showscale = T)
+        ) %>%
+  plotly::layout(
+    scene = list(
+      title="sample figure", 
+      xaxis = list(title = 'Latitude', showticklabels = FALSE), 
+      yaxis = list(title = 'Longitude', showticklabels = FALSE),
+      zaxis = list(title = 'Elevation (m)')
+      )
+    )
+
+p
+  
+```
+
+## Total Elevation Profile
+```{r Total Elevation Plot}
+# plot
+ele_plot <- ggplot(lat_lon, aes(x = dist_total, y = ele))+
+  geom_area(fill="#69b3a2", alpha=0.4)+
+  geom_line(color="#69b3a2", linewidth=.3) +
+  scale_x_continuous(name = '\nDistance (km)', 
+                     label=comma,
+                     expand = c(0,0),
+                     breaks = seq(0, 20000, by = 1000))+
+  scale_y_continuous(name = 'Elevation (m)\n',
+                     label=comma,
+                     expand = c(0,0),
+                     breaks = seq(0, 4000, by = 250)) +
+  theme_classic()+
+  theme(text = element_text(family="IBM Plex Sans"),
+        legend.position = "right",
+        legend.text = element_text(size = 16, family = 'IBM Plex Sans Light'),
+        legend.title = element_text(size = 20),
+        plot.title = element_text(face = 'bold', color = 'grey20', size = 30),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.text.x = element_text(size = 20),
+        axis.text.y = element_text(size = 24),
+        panel.border = element_blank(),
+        plot.background = element_blank())
+
+# ele_plot
+
+ggsave(plot = ele_plot,
+       filename = "Total Elevation Profile.png", 
+       width = 9, height = 6, units = "in",
+       dpi = 300, type = "cairo")
+```
+
+## Biggest climbs?
+```{r Biggest Climbs setup}
+# top n rides by elevation gain
+highest_ref <- act_df %>%
+  as.tibble() %>%
+  mutate(ascent = elev_high-elev_low,
+         start_date = gsub('T.*$', '', start_date),  
+         start_date = as.Date(start_date, format = '%Y-%m-%d'),
+         total_elevation_gain = paste('Elev. gain', total_elevation_gain)) %>% 
+  unite('facets', activity, start_date, total_elevation_gain, sep = ', ') %>%
+  slice_max(ascent, n = 10) %>%
+  select(facets, name, ascent)
+
+geo_df <- lat_lon %>%
+  group_by(facets) %>%
+  slice_max(ele) %>%
+  right_join(highest_ref, by = 'facets')
+
+
+google_map(key = Sys.getenv('GOOGLE_KEY')) %>%
+  add_circles(
+    data = geo_df, lon = 'lon', lat = 'lat', radius = 20000
+  )
+```
